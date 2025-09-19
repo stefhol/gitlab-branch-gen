@@ -1,0 +1,18 @@
+{
+	"extends": "@sindresorhus/tsconfig",
+	"compilerOptions": {
+		"target": "ES2020",
+		"module": "nodenext",
+		"lib": ["ES2020"],
+		"jsx": "react-jsx",
+		"jsxImportSource": "react",
+		"strict": true,
+		"esModuleInterop": true,
+		"skipLibCheck": true,
+		"forceConsistentCasingInFileNames": true,
+		"moduleResolution": "nodenext",
+		"resolveJsonModule": true,
+		"outDir": "./dist"
+	},
+	"include": ["src"]
+}
