@@ -7,3 +7,10 @@ edition = "2024"
 anyhow = "1.0.100"
 clap = { version = "4.5.48", features = ["derive"] }
 itertools = "0.14.0"
+os_path = "0.8.0"
+reqwest = { version = "0.12.23", features = ["json"] }
+serde = { version = "1.0.226", features = ["derive"] }
+serde_yml = "0.0.12"
+shellexpand = "3.1.1"
+tokio = { version = "1.47.1", features = ["full"] }
+urlencoding = "2.1.3"
