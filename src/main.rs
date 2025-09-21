@@ -1,11 +1,12 @@
 use std::{
     collections::HashMap,
+    fmt::Display,
     fs,
     io::{self},
     path::PathBuf,
 };
 
-use anyhow::{Ok, Result};
+use anyhow::{Ok, Result, anyhow};
 use clap::Parser;
 use os_path::OsPath;
 use serde::{Deserialize, Serialize};
@@ -59,28 +60,47 @@ struct State {
     gitlab_api: String,
     gitlab_url: String,
 }
-impl State {
-    fn new(config: &ConfigFile, cli: &Cli) -> Self {
-        Self {
-            branch_name: cli.branch_name.clone().expect("branch name has to be set"),
-            repos: config
-                .repos
-                .clone()
-                .or(cli.repos.clone())
-                .expect("Repos has to be set"),
-            gitlab_api: config
-                .gitlab_api_key
-                .clone()
-                .or(cli.gitlab_api_key.clone())
-                .expect("gitlab api key has to be set"),
-            gitlab_url: config
-                .gitlab_url
-                .clone()
-                .or(cli.gitlab_url.clone())
-                .or(Some(String::from("https://gitlab.com")))
-                .inspect(|v| println!("Using {v}"))
-                .unwrap(),
+impl Display for State {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut buffer = String::new();
+        for repo in &self.repos {
+            buffer += &format!("\n- {}", repo);
         }
+        write!(
+            f,
+            "Branch to create: {}\nGitlab Instance: {}\nRepositories to change: {}",
+            self.branch_name, self.gitlab_url, buffer
+        )
+    }
+}
+impl State {
+    fn new(config: &ConfigFile, cli: &Cli) -> Result<Self> {
+        let branch_name = cli
+            .branch_name
+            .clone()
+            .ok_or(anyhow!("branch name has to be set"))?;
+        let repos = config
+            .repos
+            .clone()
+            .or(cli.repos.clone())
+            .ok_or(anyhow!("There has to be atleast one repostiory set"))?;
+        let gitlab_api = config
+            .gitlab_api_key
+            .clone()
+            .or(cli.gitlab_api_key.clone())
+            .ok_or(anyhow!("gitlab api key has to be set"))?;
+        let gitlab_url = config
+            .gitlab_url
+            .clone()
+            .or(cli.gitlab_url.clone())
+            .or(Some(String::from("https://gitlab.com")))
+            .unwrap();
+        Ok(Self {
+            branch_name,
+            repos,
+            gitlab_api,
+            gitlab_url,
+        })
     }
 }
 
@@ -111,7 +131,8 @@ async fn main() -> Result<()> {
     }
 
     let file: ConfigFile = serde_yml::from_slice(&fs::read(&config_location)?)?;
-    let state = State::new(&file, &cli);
+    let state = State::new(&file, &cli)?;
+    println!("{}", state);
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert("PRIVATE-TOKEN", state.gitlab_api.parse()?);
     let _base_url = format!("{}/api/v4", state.gitlab_url);
@@ -119,22 +140,39 @@ async fn main() -> Result<()> {
         .default_headers(headers)
         .build()?;
 
-    let mut repos = vec![];
-    for repo in state.repos {
-        let mut repo_res = get_repository(&_client, &_base_url, &repo).await?;
-        repo_res.branch_to_create = Some(repo.to_string());
-        repos.push(repo_res.clone());
+    let mut repos: Vec<Repo> = vec![];
+    println!("Gathering plan on creating branch {}", state.branch_name);
+    for repo_name in state.repos {
+        let repo_res = get_repository(&_client, &_base_url, &repo_name).await;
+        if let Err(_err) = repo_res {
+            println!("{repo_name}: Skipped Failure on retrieving information");
+            repos.push(Repo {
+                repo: None,
+                skipped: true,
+                repo_name,
+            });
+            continue;
+        }
+        let mut repo_res = repo_res.unwrap();
+        repo_res.branch_to_create = Some(repo_name.to_string());
         let exists = branch_exists(&_client, &_base_url, &repo_res.id, &state.branch_name).await?;
-        println!("Plan on creating branch {}", state.branch_name);
         print!("{}", repo_res.web_url);
         if exists {
             print!(" ⚠️ Branch exists ⚠️")
         } else {
-            print!(" ✅ Branch can be created ✅")
+            print!(" ✅ ")
         }
         println!();
-        println!("Execute? Type y to confirm");
+        repos.push(Repo {
+            repo: Some(repo_res.clone()),
+            skipped: exists,
+            repo_name,
+        });
     }
+
+    println!("\n");
+
+    println!("Execute? Type y to confirm");
     let mut buffer = String::new();
     let stdin = io::stdin(); // We get `Stdin` here.
     stdin.read_line(&mut buffer)?;
@@ -144,7 +182,18 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    println!("\n");
+
     for repo in repos {
+        print!("{}: ", repo.repo_name);
+        if repo.skipped || repo.repo.is_none() {
+            println!("skipped");
+            continue;
+        }
+        let repo = repo.repo.unwrap();
+
+        print!("{} ", repo.web_url);
+
         let branch_created = create_branch(
             &_client,
             &_base_url,
@@ -153,19 +202,24 @@ async fn main() -> Result<()> {
             &repo.default_branch,
         )
         .await?;
-        print!("{}: ", repo.web_url);
         if branch_created {
-            print!("created")
+            println!("created ✅");
         } else {
-            print!("skipped")
+            println!("error ⛔");
         }
     }
 
     Ok(())
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Debug, Clone)]
 struct Repo {
+    repo: Option<RepoResponse>,
+    skipped: bool,
+    repo_name: String,
+}
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct RepoResponse {
     id: u64,
     default_branch: String,
     web_url: String,
@@ -176,14 +230,14 @@ async fn get_repository(
     client: &reqwest::Client,
     base_url: &str,
     repo: &str,
-) -> std::result::Result<Repo, reqwest::Error> {
+) -> anyhow::Result<RepoResponse> {
     let repo = urlencoding::encode(repo);
-    client
+    let response = client
         .get(format!("{base_url}/projects/{repo}"))
         .send()
-        .await?
-        .json()
-        .await
+        .await?;
+
+    Ok(response.json().await?)
 }
 
 async fn create_branch(
